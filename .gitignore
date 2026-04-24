@@ -1,0 +1,25 @@
+# Entorno
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Virtual env
+venv/
+.env/
+
+# Modelos IA (opcional según tu caso)
+*.pt
+*.bin
+*.h5
+
+# IDE
+.vscode/
+.idea/
