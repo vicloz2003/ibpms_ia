@@ -1,5 +1,6 @@
 import os
 import json
+from collections import deque, defaultdict
 import google.generativeai as genai
 from dotenv import load_dotenv
 from models.request_models import DiagramGenerationRequest
@@ -135,6 +136,50 @@ def _xe(text: str) -> str:
             .replace(">", "&gt;"))
 
 
+def _assign_columns(nodes: list, flows: list) -> dict[str, int]:
+    """
+    BFS-based column assignment.
+    Nodes at the same depth from the start share the same column level,
+    so parallel branches (e.g., two paths out of a DECISION) stack
+    vertically instead of spreading out horizontally.
+    """
+    outgoing: dict[str, list[str]] = {n.get("id", ""): [] for n in nodes}
+    for flow in flows:
+        src = flow.get("sourceNodeId", "")
+        tgt = flow.get("targetNodeId", "")
+        if src in outgoing:
+            outgoing[src].append(tgt)
+
+    # Prefer explicit INITIAL_NODE; fallback to nodes with no incoming edge
+    target_ids = {f.get("targetNodeId", "") for f in flows}
+    start_ids = [n.get("id", "") for n in nodes if n.get("type") == "INITIAL_NODE"]
+    if not start_ids:
+        start_ids = [n.get("id", "") for n in nodes if n.get("id", "") not in target_ids]
+
+    col: dict[str, int] = {}
+    queue: deque = deque()
+    for sid in start_ids:
+        if sid not in col:
+            col[sid] = 0
+            queue.append(sid)
+
+    while queue:
+        nid = queue.popleft()
+        for tgt in outgoing.get(nid, []):
+            new_col = col[nid] + 1
+            if tgt not in col or col[tgt] < new_col:
+                col[tgt] = new_col
+                queue.append(tgt)
+
+    # Fallback: disconnected nodes get column 0
+    for n in nodes:
+        nid = n.get("id", "")
+        if nid not in col:
+            col[nid] = 0
+
+    return col
+
+
 def generate_bpmn_xml(data: dict) -> str:
     partitions = data.get("partitions", [])
     nodes = data.get("nodes", [])
@@ -145,16 +190,28 @@ def generate_bpmn_xml(data: dict) -> str:
     PARTICIPANT_Y = 80
     LANE_LABEL_W = 30        # bpmn-js pool header width
     LANE_INNER_X = PARTICIPANT_X + LANE_LABEL_W  # x where lanes start = 160
-    COL_W = 200              # horizontal spacing between nodes
-    LANE_H = 200             # height of each swimlane
+    COL_W = 220              # horizontal spacing between nodes
     NODE_START_X = LANE_INNER_X + 70  # first node column, past lane label
 
-    # Calculate total width based on widest lane
-    max_nodes_in_lane = max(
-        (len([n for n in nodes if n.get("partitionId") == p.get("id")]) for p in partitions),
-        default=1
-    )
-    total_width = max(900, NODE_START_X - PARTICIPANT_X + max_nodes_in_lane * COL_W + 80)
+    # ── BFS column assignment & slot grouping ─────────────────────────────────
+    # Parallel branches share the same column so they stack vertically.
+    node_cols = _assign_columns(nodes, flows)
+
+    slot_map: dict[tuple, list] = defaultdict(list)
+    for _node in nodes:
+        _nid = _node.get("id", "")
+        _pid = _node.get("partitionId", "")
+        _part_idx = next(
+            (j for j, p in enumerate(partitions) if p.get("id") == _pid), 0
+        )
+        slot_map[(_part_idx, node_cols.get(_nid, 0))].append(_node)
+
+    max_stack = max((len(v) for v in slot_map.values()), default=1)
+    max_col = max(node_cols.values(), default=0)
+
+    # Dynamically size lane height to accommodate stacked nodes
+    LANE_H = max(200, max_stack * 110)
+    total_width = max(900, NODE_START_X - PARTICIPANT_X + (max_col + 1) * COL_W + 80)
     lane_width = total_width - LANE_LABEL_W
     total_height = max(LANE_H, len(partitions) * LANE_H)
 
@@ -181,8 +238,10 @@ def generate_bpmn_xml(data: dict) -> str:
         tgt = flow.get("targetNodeId", "")
         cond = flow.get("guardCondition")
         if cond:
+            # name makes the condition text visible as a label on the arrow
             process_elements += (
-                f'<bpmn:sequenceFlow id="{fid}" sourceRef="{src}" targetRef="{tgt}">'
+                f'<bpmn:sequenceFlow id="{fid}" sourceRef="{src}" targetRef="{tgt}"'
+                f' name="{_xe(cond)}">'
                 f'<bpmn:conditionExpression>{_xe(cond)}</bpmn:conditionExpression>'
                 f'</bpmn:sequenceFlow>\n'
             )
@@ -222,47 +281,96 @@ def generate_bpmn_xml(data: dict) -> str:
             f'</bpmndi:BPMNShape>\n'
         )
 
+    # ── Pre-calculate node bounds (slot-based, supports vertical stacking) ──────
+    node_bounds: dict[str, tuple[int, int, int, int]] = {}
+    for (_part_idx, _col_idx), slot in slot_map.items():
+        num = len(slot)
+        for sub_idx, _node in enumerate(slot):
+            _ntype = _node.get("type", "ACTION")
+            _nid = _node.get("id", "")
+            if _ntype in ("INITIAL_NODE", "ACTIVITY_FINAL"):
+                _w, _h = 36, 36
+            elif _ntype in ("DECISION", "MERGE", "FORK", "JOIN"):
+                _w, _h = 50, 50
+            else:
+                _w, _h = 100, 80
+            _nx = NODE_START_X + _col_idx * COL_W
+            lane_y = PARTICIPANT_Y + _part_idx * LANE_H
+            if num == 1:
+                _ny = lane_y + (LANE_H - _h) // 2
+            else:
+                # Distribute nodes evenly within the lane height
+                slot_h = LANE_H / num
+                _ny = int(lane_y + sub_idx * slot_h + (slot_h - _h) / 2)
+            node_bounds[_nid] = (_nx, _ny, _w, _h)
+
     # ── DI: node shapes ───────────────────────────────────────────────────────
     node_shapes = ""
     for node in nodes:
-        ntype = node.get("type", "ACTION")
         nid = node.get("id", "")
-        pid = node.get("partitionId", "")
-        partition_idx = next(
-            (j for j, p in enumerate(partitions) if p.get("id") == pid), 0
-        )
-        lane_nodes = [n for n in nodes if n.get("partitionId") == pid]
-        col_idx = lane_nodes.index(node) if node in lane_nodes else 0
-
-        if ntype in ("INITIAL_NODE", "ACTIVITY_FINAL"):
-            w, h = 36, 36
-        elif ntype in ("DECISION", "MERGE", "FORK", "JOIN"):
-            w, h = 50, 50
-        else:
-            w, h = 100, 80
-
-        nx = NODE_START_X + col_idx * COL_W
-        # Center the node vertically in its lane
-        lane_y = PARTICIPANT_Y + partition_idx * LANE_H
-        ny = lane_y + (LANE_H - h) // 2
-
+        nx, ny, w, h = node_bounds[nid]
         node_shapes += (
             f'<bpmndi:BPMNShape id="{nid}_di" bpmnElement="{nid}">\n'
             f'  <dc:Bounds x="{nx}" y="{ny}" width="{w}" height="{h}"/>\n'
             f'</bpmndi:BPMNShape>\n'
         )
 
-    # ── DI: edges ─────────────────────────────────────────────────────────────
+    # ── DI: edges with waypoints (prevents erratic routing in bpmn-js) ────────
+    # Same-lane:   right-center → left-center  (straight)
+    # Cross-lane:  right-center → mid-x,same-y → mid-x,target-y → left-center
+    _node_map = {n.get("id"): n for n in nodes}
     edges = ""
     for flow in flows:
         fid = flow.get("id", "")
-        edges += f'<bpmndi:BPMNEdge id="{fid}_di" bpmnElement="{fid}"/>\n'
+        src_id = flow.get("sourceNodeId", "")
+        tgt_id = flow.get("targetNodeId", "")
+        cond = flow.get("guardCondition")
+        src_b = node_bounds.get(src_id)
+        tgt_b = node_bounds.get(tgt_id)
+        waypoints = ""
+        label_xml = ""
+        if src_b and tgt_b:
+            sx, sy, sw, sh = src_b
+            tx, ty, tw, th = tgt_b
+            wp_sx, wp_sy = sx + sw, sy + sh // 2
+            wp_tx, wp_ty = tx, ty + th // 2
+            same_lane = (
+                _node_map.get(src_id, {}).get("partitionId")
+                == _node_map.get(tgt_id, {}).get("partitionId")
+            )
+            if same_lane:
+                waypoints = (
+                    f'<di:waypoint x="{wp_sx}" y="{wp_sy}"/>'
+                    f'<di:waypoint x="{wp_tx}" y="{wp_ty}"/>'
+                )
+            else:
+                mid_x = (wp_sx + wp_tx) // 2
+                waypoints = (
+                    f'<di:waypoint x="{wp_sx}" y="{wp_sy}"/>'
+                    f'<di:waypoint x="{mid_x}" y="{wp_sy}"/>'
+                    f'<di:waypoint x="{mid_x}" y="{wp_ty}"/>'
+                    f'<di:waypoint x="{wp_tx}" y="{wp_ty}"/>'
+                )
+            if cond:
+                lx = (wp_sx + wp_tx) // 2 - 50
+                ly = (wp_sy + wp_ty) // 2 - 14
+                label_xml = (
+                    f'<bpmndi:BPMNLabel>'
+                    f'<dc:Bounds x="{lx}" y="{ly}" width="100" height="14"/>'
+                    f'</bpmndi:BPMNLabel>'
+                )
+        edges += (
+            f'<bpmndi:BPMNEdge id="{fid}_di" bpmnElement="{fid}">'
+            f'{waypoints}{label_xml}'
+            f'</bpmndi:BPMNEdge>\n'
+        )
 
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" '
         'xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" '
         'xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" '
+        'xmlns:di="http://www.omg.org/spec/DD/20100524/DI" '
         'id="Definitions_ia" targetNamespace="http://bpmn.io/schema/bpmn">\n'
         '  <bpmn:collaboration id="Collaboration_1">\n'
         '    <bpmn:participant id="Participant_1" name="Proceso" processRef="Process_1"/>\n'
